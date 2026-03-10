@@ -1,0 +1,203 @@
+---
+title: "Structural Code Violation Analysis in Philadelphia"
+author: "Manas Vesvikar"
+date: "2025-06-01"
+output:
+  html_document:
+    toc: true
+    df_print: paged
+  pdf_document:
+    toc: true
+    number_sections: true
+    fig_caption: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(tidyverse)
+library(tidymodels)
+library(janitor)
+library(lubridate)
+library(ggplot2)
+library(vip)
+library(rpart.plot)
+library(naniar)
+```
+
+#  Introduction
+
+This report investigates structural code violations in the city of Philadelphia using a 5K-sample dataset of property code violations. The objective is to build interpretable models to classify whether a violation is structural in nature, based on categorical and spatial attributes.
+
+#  Data Overview
+
+The dataset includes 5,000 code violations with variables such as case status, violation status, council district, latitude/longitude, and a title describing the violation. We cleaned and transformed the data to create a binary outcome variable, `is_structural_violation`.
+
+```{r load-data}
+violations <- read_csv("data_processed/violations_sample.csv") %>%
+  clean_names()
+
+head(violations)
+```
+
+##  Missing Data Overview
+
+```{r missing-data-visuals}
+gg_miss_var(violations) + labs(title = "Missing Data by Column (Sample Dataset)")
+
+vis_miss(violations[1:500, ]) +
+  labs(title = "Missing Data Heatmap (First 500 Rows)")
+```
+
+#  Exploratory Data Analysis
+
+##  Monthly Violation Trends
+
+```{r monthly-trends}
+violations %>%
+  mutate(casecreateddate = ymd_hms(casecreateddate),  # Ensure proper datetime parsing
+         month = floor_date(casecreateddate, "month")) %>%
+  filter(!is.na(month)) %>%  # Remove rows where date parsing failed
+  count(month) %>%
+  ggplot(aes(x = month, y = n)) +
+  geom_line(color = "brown", size = 1) +
+  labs(title = "Monthly Violation Trends",
+       x = "Month", y = "Number of Violations") +
+  theme_minimal()
+```
+
+##  Violation Status Distribution
+
+```{r status-distribution}
+violations %>%
+  count(violationstatus) %>%
+  ggplot(aes(x = fct_reorder(violationstatus, n), y = n, fill = violationstatus)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  labs(title = "Violation Status Distribution", x = "Status", y = "Count") +
+  theme_minimal()
+```
+
+##  Top 10 Violation Types
+
+```{r top-violations}
+violations %>%
+  count(violationcodetitle, sort = TRUE) %>%
+  top_n(10) %>%
+  ggplot(aes(x = fct_reorder(violationcodetitle, n), y = n)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Top 10 Violation Types", x = "Violation Title", y = "Count") +
+  theme_minimal()
+```
+
+#  Modeling
+
+We compare two models: logistic regression and a decision tree.
+
+```{r load-train-test}
+train_data <- read_csv("data_processed/train_data.csv")
+test_data <- read_csv("data_processed/test_data.csv")
+```
+
+##  Logistic Regression
+
+```{r logreg-model}
+log_recipe <- recipe(is_structural_violation ~ ., data = train_data) %>%
+  step_dummy(all_nominal_predictors()) %>% 
+  step_normalize(all_numeric_predictors())
+
+log_spec <- logistic_reg() %>%
+  set_engine("glm")
+
+log_wf <- workflow() %>%
+  add_recipe(log_recipe) %>%
+  add_model(log_spec)
+
+log_fit <- fit(log_wf, data = train_data)
+
+log_preds <- predict(log_fit, test_data, type = "prob") %>%
+  bind_cols(predict(log_fit, test_data)) %>%
+  bind_cols(test_data %>% select(is_structural_violation)) %>%
+  mutate(is_structural_violation = factor(is_structural_violation))
+
+log_metrics <- metric_set(accuracy, roc_auc, kap)(
+  log_preds,
+  truth = is_structural_violation,
+  estimate = .pred_class,
+  .pred_Yes
+)
+log_metrics
+```
+
+##  Decision Tree
+
+```{r tree-model}
+tree_recipe <- recipe(is_structural_violation ~ ., data = train_data)
+tree_spec <- decision_tree(tree_depth = 5) %>%
+  set_engine("rpart") %>%
+  set_mode("classification")
+
+tree_wf <- workflow() %>%
+  add_recipe(tree_recipe) %>%
+  add_model(tree_spec)
+
+tree_fit <- fit(tree_wf, data = train_data)
+
+tree_preds <- predict(tree_fit, test_data, type = "prob") %>%
+  bind_cols(predict(tree_fit, test_data)) %>%
+  bind_cols(test_data %>% select(is_structural_violation)) %>%
+  mutate(is_structural_violation = factor(is_structural_violation))
+
+tree_metrics <- metric_set(accuracy, roc_auc, kap)(
+  tree_preds,
+  truth = is_structural_violation,
+  estimate = .pred_class,
+  .pred_Yes
+)
+tree_metrics
+```
+
+##  Model Comparison – ROC Curve
+
+```{r roc-curve}
+log_roc <- predict(log_fit, test_data, type = "prob") %>%
+  bind_cols(test_data %>% mutate(is_structural_violation = factor(is_structural_violation))) %>%
+  roc_curve(truth = is_structural_violation, .pred_Yes) %>%
+  mutate(model = "Logistic Regression")
+
+tree_roc <- predict(tree_fit, test_data, type = "prob") %>%
+  bind_cols(test_data %>% mutate(is_structural_violation = factor(is_structural_violation))) %>%
+  roc_curve(truth = is_structural_violation, .pred_Yes) %>%
+  mutate(model = "Decision Tree")
+
+bind_rows(log_roc, tree_roc) %>%
+  autoplot() +
+  labs(title = "ROC Curves: Logistic Regression vs Decision Tree") +
+  theme_minimal()
+```
+
+##  Decision Tree Visualization
+
+```{r tree-plot}
+final_tree <- extract_fit_parsnip(tree_fit)$fit
+rpart.plot(final_tree, main = "Decision Tree Structure")
+```
+
+##  Feature Importance (Decision Tree)
+
+```{r vip-tree}
+final_tree_model <- extract_fit_parsnip(tree_fit)$fit
+vip(final_tree_model,
+    num_features = 10,
+    bar = TRUE,
+    aesthetics = list(fill = "forestgreen")) +
+  ggtitle("Top Features – Decision Tree Model") +
+  theme_minimal()
+```
+
+#  Conclusion
+
+Both models achieved the same accuracy (~77.4%), but the decision tree had a slightly higher ROC AUC (0.289 vs. 0.223). The top predictors were `caseprioritydesc` and `violationstatus`. The decision tree provided stronger interpretability through visual structure and VIP analysis, while logistic regression gave smoother probability estimates.
+
+This analysis can support city inspectors and planners in prioritizing inspections based on structural risk signals visible in public case records.
+
